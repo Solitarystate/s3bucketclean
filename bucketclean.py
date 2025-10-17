@@ -391,7 +391,7 @@ class BucketCleanupManager:
     def delete_object_version(self, bucket_name, object_key, version_id, version_type):
         """Delete a specific version of an object."""
         if self.dry_run:
-            logger.info(f"[DRY RUN] Would delete {version_type}: {object_key} (version: {version_id})")
+            logger.info(f"[DRY RUN] Would be ok to delete {version_type}: {object_key} (version: {version_id})")
             return True
         
         try:
@@ -468,7 +468,7 @@ class BucketCleanupManager:
     def delete_bucket(self, bucket_name):
         """Delete the bucket if it's empty."""
         if self.dry_run:
-            logger.info(f"[DRY RUN] Would delete bucket: {bucket_name}")
+            logger.info(f"[DRY RUN] Would be ok to delete bucket: {bucket_name}")
             return True
         
         try:
@@ -737,7 +737,8 @@ def main(bucket_name, endpoint_url, profile_name=None, access_key=None, secret_k
         if not all_deleted:
             logger.warning("Not all objects were deleted successfully, skipping bucket deletion")
         elif dry_run:
-            logger.info("DRY RUN: Would attempt to delete bucket")
+            logger.info("DRY RUN: Would not attempt to delete bucket")
+            logger.info("Bucket deletion skipped in dry run mode")
     
     end_time = time.time()
     
