@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # Author: Sudeesh Varier
 # Date: 2025-08-01
-# Description: Enhanced script to clean up buckets in S3 compliant Storage systems along with compliance lock checking
+# Description: Enhanced script to clean up buckets in StorageGrid with compliance lock checking
 import logging
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
@@ -15,8 +15,9 @@ import os
 import sys
 from pathlib import Path
 
-LOG_PATH = "/var/log/bucketclean.log"
-S3_URL_ENDPOINT = "supply_your_own_endpoint_here" # This would be your default endpoint if not explicitly supplied as arguments or choose to pass it as an argument
+LOG_PATH = "/var/log/storagegrid/bucketclean.log"
+URL_ENDPOINT_OSL = "https://ep.s3-no.basefarm-orange.com"
+URL_ENDPOINT_STH = "https://ep.s3-se.basefarm-orange.com"
 
 class BucketCleanupManager:
     def __init__(self, endpoint_url, profile_name=None, access_key=None, secret_key=None, debug=False, dry_run=False):
@@ -205,9 +206,9 @@ class BucketCleanupManager:
         except ClientError as e:
             error_code = e.response['Error']['Code']
             
-            if error_code in ['ObjectLockConfigurationNotFoundError', 'InvalidRequest']:
+            if error_code in ['ObjectLockConfigurationNotFoundError', 'NoSuchObjectLockConfiguration', 'InvalidRequest']:
                 if self.debug:
-                    print(f"DEBUG: Bucket {bucket_name} does not have Object Lock configuration")
+                    print(f"DEBUG: Bucket {bucket_name} does not have Object Lock configuration (error: {error_code})")
                 
                 logger.info(f"✓ Bucket {bucket_name} does not have Object Lock configuration - skipping compliance checks")
                 
@@ -216,12 +217,9 @@ class BucketCleanupManager:
                     'configuration': None
                 }
             else:
-                logger.warning(f"Error checking Object Lock configuration for bucket {bucket_name}: {e}")
-                # If we can't determine the status, assume it might be enabled to be safe
-                return {
-                    'enabled': True,  # Assume enabled to be safe
-                    'configuration': None
-                }
+                logger.warning(f"Unexpected error (code: {error_code}) checking Object Lock configuration for bucket {bucket_name}: {e}")
+                # Unknown error - log and re-raise so the caller can decide how to handle it
+                raise
 
     def check_compliance_lock(self, bucket_name, key, version_id=None):
         """Check if an object has compliance lock and if it's still active."""
@@ -325,7 +323,11 @@ class BucketCleanupManager:
         logger.info("Checking bucket Object Lock configuration...")
         
         # Step 1: Check if bucket has Object Lock configuration
-        object_lock_config = self.check_bucket_object_lock_configuration(bucket_name)
+        try:
+            object_lock_config = self.check_bucket_object_lock_configuration(bucket_name)
+        except ClientError as e:
+            logger.error(f"✗ Cannot determine Object Lock status for bucket {bucket_name}: {e}. Aborting to be safe.")
+            return False
         
         if not object_lock_config['enabled']:
             logger.info("✓ Bucket has no Object Lock configuration - no compliance locks to check")
@@ -391,7 +393,7 @@ class BucketCleanupManager:
     def delete_object_version(self, bucket_name, object_key, version_id, version_type):
         """Delete a specific version of an object."""
         if self.dry_run:
-            logger.info(f"[DRY RUN] Would be ok to delete {version_type}: {object_key} (version: {version_id})")
+            logger.info(f"[DRY RUN] Would delete {version_type}: {object_key} (version: {version_id})")
             return True
         
         try:
@@ -468,7 +470,7 @@ class BucketCleanupManager:
     def delete_bucket(self, bucket_name):
         """Delete the bucket if it's empty."""
         if self.dry_run:
-            logger.info(f"[DRY RUN] Would be ok to delete bucket: {bucket_name}")
+            logger.info(f"[DRY RUN] Would delete bucket: {bucket_name}")
             return True
         
         try:
@@ -737,8 +739,7 @@ def main(bucket_name, endpoint_url, profile_name=None, access_key=None, secret_k
         if not all_deleted:
             logger.warning("Not all objects were deleted successfully, skipping bucket deletion")
         elif dry_run:
-            logger.info("DRY RUN: Would not attempt to delete bucket")
-            logger.info("Bucket deletion skipped in dry run mode")
+            logger.info("DRY RUN: Would attempt to delete bucket")
     
     end_time = time.time()
     
@@ -784,8 +785,8 @@ if __name__ == "__main__":
                       help="Bucket name to clean (required)")
     parser.add_option("-v", "--debug", dest="debug", default=False, action="store_true", 
                       help="Enable debug mode with detailed summary")
-    parser.add_option("-e", "--endpoint", dest="endpoint", default=S3_URL_ENDPOINT, 
-                      help=f"S3 endpoint URL (default: {S3_URL_ENDPOINT})")
+    parser.add_option("-e", "--endpoint", dest="endpoint", default=URL_ENDPOINT_OSL, 
+                      help=f"S3 endpoint URL (default: {URL_ENDPOINT_OSL})")
     
     # Credential options
     parser.add_option("-p", "--profile", dest="profile", action="store", 
