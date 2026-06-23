@@ -623,7 +623,7 @@ def debug_aws_configuration():
     debug_text = "\n".join(debug_output)
     print(debug_text, flush=True)
 
-def main(bucket_name, endpoint_url, profile_name=None, access_key=None, secret_key=None, debug=False, dry_run=False):
+def main(bucket_name, endpoint_url, profile_name=None, access_key=None, secret_key=None, debug=False, dry_run=False, delete_bucket=False):
     """Main function to clean up the specified bucket."""
     start_time = time.time()
     
@@ -683,12 +683,14 @@ def main(bucket_name, endpoint_url, profile_name=None, access_key=None, secret_k
     
     if object_count == 0:
         logger.info("Bucket is already empty")
-        if not dry_run:
+        if not dry_run and delete_bucket:
             success = cleanup_manager.delete_bucket(bucket_name)
             if success:
                 logger.info("✓ Empty bucket deleted successfully")
             else:
                 logger.error("✗ Failed to delete empty bucket")
+        elif not delete_bucket:
+            logger.info("--delete-bucket not specified, skipping bucket deletion")
         end_time = time.time()
         if debug:
             cleanup_manager.print_summary(bucket_name, start_time, end_time)
@@ -731,7 +733,7 @@ def main(bucket_name, endpoint_url, profile_name=None, access_key=None, secret_k
     all_deleted = cleanup_manager.cleanup_object_versions(bucket_name, versions_by_object)
     
     # Step 6: Delete bucket if all objects were successfully removed
-    if all_deleted and not dry_run:
+    if all_deleted and not dry_run and delete_bucket:
         logger.info("All objects deleted successfully, attempting to delete bucket...")
         bucket_deleted = cleanup_manager.delete_bucket(bucket_name)
     else:
@@ -740,6 +742,8 @@ def main(bucket_name, endpoint_url, profile_name=None, access_key=None, secret_k
             logger.warning("Not all objects were deleted successfully, skipping bucket deletion")
         elif dry_run:
             logger.info("DRY RUN: Would attempt to delete bucket")
+        elif not delete_bucket:
+            logger.info("--delete-bucket not specified, skipping bucket deletion")
     
     end_time = time.time()
     
@@ -748,7 +752,7 @@ def main(bucket_name, endpoint_url, profile_name=None, access_key=None, secret_k
         cleanup_manager.print_summary(bucket_name, start_time, end_time)
     
     # Final status
-    if all_deleted and (bucket_deleted or dry_run):
+    if all_deleted and (bucket_deleted or dry_run or not delete_bucket):
         logger.info("✓ Bucket cleanup completed successfully")
         return True
     else:
@@ -795,6 +799,8 @@ if __name__ == "__main__":
                       help="AWS access key ID")
     parser.add_option("--secret-key", dest="secret_key", action="store", 
                       help="AWS secret access key")
+    parser.add_option("--delete-bucket", dest="delete_bucket", default=False, action="store_true",
+                      help="Delete the bucket itself after all objects have been cleaned up")
     
     (options, args) = parser.parse_args()
     
@@ -814,6 +820,7 @@ if __name__ == "__main__":
     logger.info(f"Debug mode: {options.debug}")
     logger.info(f"Profile: {options.profile or 'default'}")
     logger.info(f"Using explicit credentials: {bool(options.access_key)}")
+    logger.info(f"Delete bucket after cleanup: {options.delete_bucket}")
     
     try:
         success = main(
@@ -823,7 +830,8 @@ if __name__ == "__main__":
             options.access_key,
             options.secret_key,
             options.debug, 
-            options.dryrun
+            options.dryrun,
+            options.delete_bucket
         )
         exit_code = 0 if success else 1
     except KeyboardInterrupt:
