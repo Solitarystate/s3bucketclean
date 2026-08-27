@@ -8,7 +8,7 @@ import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
 import time
 from optparse import OptionParser
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 import json
 import os
@@ -20,10 +20,11 @@ URL_ENDPOINT_OSL = "https://ep.s3-no.basefarm-orange.com"
 URL_ENDPOINT_STH = "https://ep.s3-se.basefarm-orange.com"
 
 class BucketCleanupManager:
-    def __init__(self, endpoint_url, profile_name=None, access_key=None, secret_key=None, debug=False, dry_run=False):
+    def __init__(self, endpoint_url, profile_name=None, access_key=None, secret_key=None, debug=False, dry_run=False, force=False):
         self.endpoint_url = endpoint_url
         self.debug = debug
         self.dry_run = dry_run
+        self.force = force
         
         # Initialize S3 client with credentials
         self.s3 = self._initialize_s3_client(endpoint_url, profile_name, access_key, secret_key)
@@ -247,37 +248,72 @@ class BucketCleanupManager:
                 
         except ClientError as e:
             error_code = e.response['Error']['Code']
+            error_message = e.response['Error'].get('Message', '')
             if error_code in ['NoSuchObjectLockConfiguration', 'InvalidRequest']:
                 # These errors indicate no object lock, which is fine
                 return {'locked': False, 'retention_until': None, 'can_delete': True}
+            elif (error_code == 'MethodNotAllowed' or
+                  (error_code == 'InvalidArgument' and 'version id' in error_message.lower())):
+                # StorageGrid doesn't support per-object GetObjectRetention; use bucket default.
+                return {'locked': 'use_bucket_default', 'retention_until': None, 'can_delete': None}
             else:
                 logger.warning(f"Error checking compliance lock for {key}: {e}")
                 # For other errors, assume locked to be safe
                 return {'locked': True, 'retention_until': None, 'can_delete': False}
 
-    def get_object_count(self, bucket_name):
+    def _calc_default_retention_expiry(self, last_modified, lock_configuration):
+        """
+        Calculate whether an object is still within the bucket's default retention period.
+        Used as a fallback when GetObjectRetention fails (e.g. StorageGrid returning
+        InvalidArgument for objects with no per-object retention override).
+
+        Returns:
+            tuple: (is_locked: bool, retention_until: datetime or None)
+        """
+        if not lock_configuration:
+            return False, None
+
+        default_ret = lock_configuration.get('Rule', {}).get('DefaultRetention', {})
+        days = default_ret.get('Days')
+        years = default_ret.get('Years')
+
+        if days is None and years is None:
+            return False, None
+
+        retention_days = days if days is not None else (years * 365)
+        retention_until = last_modified + timedelta(days=retention_days)
+        is_locked = datetime.now(timezone.utc) < retention_until
+        return is_locked, retention_until
+
+    def get_object_count(self, bucket_name, prefix=""):
         """Get total count of objects in the bucket."""
         try:
             paginator = self.s3.get_paginator('list_objects_v2')
-            page_iterator = paginator.paginate(Bucket=bucket_name)
-            
+            paginate_params = {'Bucket': bucket_name}
+            if prefix:
+                paginate_params['Prefix'] = prefix
+            page_iterator = paginator.paginate(**paginate_params)
+
             total_count = 0
             for page in page_iterator:
                 if 'Contents' in page:
                     total_count += len(page['Contents'])
-            
+
             return total_count
         except ClientError as e:
             logger.error(f"Error counting objects in bucket {bucket_name}: {e}")
             return 0
 
-    def get_all_object_versions(self, bucket_name):
+    def get_all_object_versions(self, bucket_name, prefix=""):
         """Get all object versions in the bucket with batched processing."""
         versions_by_object = defaultdict(list)
-        
+
         try:
             paginator = self.s3.get_paginator('list_object_versions')
-            page_iterator = paginator.paginate(Bucket=bucket_name)
+            paginate_params = {'Bucket': bucket_name}
+            if prefix:
+                paginate_params['Prefix'] = prefix
+            page_iterator = paginator.paginate(**paginate_params)
             
             processed_versions = 0
             for page in page_iterator:
@@ -346,12 +382,33 @@ class BucketCleanupManager:
         if self.debug:
             print(f"DEBUG: Checking compliance locks for {total_to_check} object versions...")
         
+        default_mode = (
+            object_lock_config['configuration']
+            .get('Rule', {}).get('DefaultRetention', {}).get('Mode', 'UNKNOWN')
+        )
+
         for object_key, versions in versions_by_object.items():
             for version in versions:
                 compliance_info = self.check_compliance_lock(
                     bucket_name, object_key, version['VersionId']
                 )
-                
+
+                # StorageGrid fallback: per-object retention unavailable, use bucket default
+                if compliance_info['locked'] == 'use_bucket_default':
+                    is_locked, retention_until = self._calc_default_retention_expiry(
+                        version['LastModified'], object_lock_config['configuration']
+                    )
+                    compliance_info = {
+                        'locked': is_locked,
+                        'retention_until': retention_until,
+                        'can_delete': not is_locked,
+                        'mode': default_mode
+                    }
+                    if self.debug:
+                        print(f"DEBUG: Used bucket-default retention for {object_key} "
+                              f"(version {version['VersionId'][:8]}...) "
+                              f"- locked: {is_locked}, expires: {retention_until}")
+
                 checked_count += 1
                 if checked_count % 100 == 0 and self.debug:
                     print(f"DEBUG: Checked compliance locks for {checked_count}/{total_to_check} versions...")
@@ -360,12 +417,16 @@ class BucketCleanupManager:
                     self.stats['compliance_locked_count'] += 1
                     
                     if not compliance_info['can_delete']:
-                        future_locked_objects.append({
-                            'key': object_key,
-                            'version_id': version['VersionId'],
-                            'retention_until': compliance_info['retention_until'],
-                            'mode': compliance_info.get('mode', 'UNKNOWN')
-                        })
+                        mode = compliance_info.get('mode', 'UNKNOWN')
+                        if self.force and mode == 'GOVERNANCE':
+                            logger.info(f"Force-bypassing governance lock: {object_key} (version: {version['VersionId']})")
+                        else:
+                            future_locked_objects.append({
+                                'key': object_key,
+                                'version_id': version['VersionId'],
+                                'retention_until': compliance_info['retention_until'],
+                                'mode': mode
+                            })
                     else:
                         past_locked_objects.append({
                             'key': object_key,
@@ -393,15 +454,15 @@ class BucketCleanupManager:
     def delete_object_version(self, bucket_name, object_key, version_id, version_type):
         """Delete a specific version of an object."""
         if self.dry_run:
-            logger.info(f"[DRY RUN] Would delete {version_type}: {object_key} (version: {version_id})")
+            bypass = " [force-bypass governance]" if self.force else ""
+            logger.info(f"[DRY RUN] Would delete{bypass} {version_type}: {object_key} (version: {version_id})")
             return True
         
         try:
-            self.s3.delete_object(
-                Bucket=bucket_name,
-                Key=object_key,
-                VersionId=version_id
-            )
+            params = {'Bucket': bucket_name, 'Key': object_key, 'VersionId': version_id}
+            if self.force:
+                params['BypassGovernanceRetention'] = True
+            self.s3.delete_object(**params)
             logger.debug(f"Deleted {version_type}: {object_key} (version: {version_id})")
             return True
             
@@ -623,26 +684,30 @@ def debug_aws_configuration():
     debug_text = "\n".join(debug_output)
     print(debug_text, flush=True)
 
-def main(bucket_name, endpoint_url, profile_name=None, access_key=None, secret_key=None, debug=False, dry_run=False, delete_bucket=False):
+def main(bucket_name, endpoint_url, profile_name=None, access_key=None, secret_key=None, debug=False, dry_run=False, delete_bucket=False, force=False, prefix=""):
     """Main function to clean up the specified bucket."""
     start_time = time.time()
-    
+
     # Add comprehensive debugging
     if debug:
         debug_aws_configuration()
         print(f"DEBUG: Starting main() with parameters:")
         print(f"  bucket_name: {bucket_name}")
+        print(f"  prefix: {prefix or '(none)'}")
         print(f"  endpoint_url: {endpoint_url}")
         print(f"  profile_name: {profile_name}")
         print(f"  access_key provided: {bool(access_key)}")
         print(f"  secret_key provided: {bool(secret_key)}")
         print(flush=True)
-    
-    logger.info(f"Starting enhanced cleanup for bucket: {bucket_name}")
+
+    if prefix:
+        logger.info(f"Starting enhanced cleanup for bucket: {bucket_name} under prefix: {prefix}")
+    else:
+        logger.info(f"Starting enhanced cleanup for bucket: {bucket_name}")
     
     # Initialize cleanup manager
     try:
-        cleanup_manager = BucketCleanupManager(endpoint_url, profile_name, access_key, secret_key, debug, dry_run)
+        cleanup_manager = BucketCleanupManager(endpoint_url, profile_name, access_key, secret_key, debug, dry_run, force)
         if debug:
             print("DEBUG: BucketCleanupManager initialized successfully", flush=True)
     except Exception as e:
@@ -677,9 +742,12 @@ def main(bucket_name, endpoint_url, profile_name=None, access_key=None, secret_k
     # Step 2: Get object count
     if debug:
         print("DEBUG: Counting objects in bucket...", flush=True)
-    object_count = cleanup_manager.get_object_count(bucket_name)
+    object_count = cleanup_manager.get_object_count(bucket_name, prefix)
     cleanup_manager.stats['total_objects'] = object_count
-    logger.info(f"✓ Found {object_count} objects in bucket")
+    if prefix:
+        logger.info(f"✓ Found {object_count} objects in bucket under prefix: {prefix}")
+    else:
+        logger.info(f"✓ Found {object_count} objects in bucket")
     
     if object_count == 0:
         logger.info("Bucket is already empty")
@@ -700,7 +768,7 @@ def main(bucket_name, endpoint_url, profile_name=None, access_key=None, secret_k
     if debug:
         print("DEBUG: Retrieving all object versions...", flush=True)
     logger.info("Retrieving all object versions...")
-    versions_by_object = cleanup_manager.get_all_object_versions(bucket_name)
+    versions_by_object = cleanup_manager.get_all_object_versions(bucket_name, prefix)
     total_versions = sum(len(versions) for versions in versions_by_object.values())
     cleanup_manager.stats['total_versions'] = total_versions
     logger.info(f"✓ Found {total_versions} total versions across all objects")
@@ -801,7 +869,11 @@ if __name__ == "__main__":
                       help="AWS secret access key")
     parser.add_option("--delete-bucket", dest="delete_bucket", default=False, action="store_true",
                       help="Delete the bucket itself after all objects have been cleaned up")
-    
+    parser.add_option("--force", dest="force", default=False, action="store_true",
+                      help="Bypass Governance mode retention locks. Compliance mode locks still block deletion.")
+    parser.add_option("-x", "--prefix", dest="prefix", action="store", default="",
+                      help="Only process objects under this key prefix (e.g. 'backups/node1/')")
+
     (options, args) = parser.parse_args()
     
     if not options.bucket:
@@ -821,17 +893,21 @@ if __name__ == "__main__":
     logger.info(f"Profile: {options.profile or 'default'}")
     logger.info(f"Using explicit credentials: {bool(options.access_key)}")
     logger.info(f"Delete bucket after cleanup: {options.delete_bucket}")
+    logger.info(f"Force governance bypass: {options.force}")
+    logger.info(f"Prefix filter: {options.prefix or '(entire bucket)'}")
     
     try:
         success = main(
-            options.bucket, 
-            options.endpoint, 
+            options.bucket,
+            options.endpoint,
             options.profile,
             options.access_key,
             options.secret_key,
-            options.debug, 
+            options.debug,
             options.dryrun,
-            options.delete_bucket
+            options.delete_bucket,
+            options.force,
+            options.prefix
         )
         exit_code = 0 if success else 1
     except KeyboardInterrupt:
