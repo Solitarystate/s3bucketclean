@@ -1,3 +1,11 @@
 create_test_data.sh
+test_streaming.py
+test_streaming_simple.py
 __pycache__*
+__pycache__/bucketclean.cpython-314.pyc
+IMPLEMENTATION_SUMMARY.md
 
+# VS Code settings
+.vscode/
+
+venv/
