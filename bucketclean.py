@@ -477,55 +477,138 @@ class BucketCleanupManager:
             return False
 
     def cleanup_object_versions(self, bucket_name, versions_by_object):
-        """Delete all versions of all objects in the bucket."""
+        """Delete all versions of all objects in the bucket using S3 batch delete API."""
         logger.info(f"Starting deletion of {len(versions_by_object)} objects...")
-        
+
         all_successful = True
-        processed_objects = 0
-        
+
+        # 1. Flatten all versions into a single list of tasks
+        all_versions_to_delete = []
         for object_key, versions in versions_by_object.items():
             total_versions = len(versions)
-            deleted_count = 0
-            processed_objects += 1
-            
-            if self.debug and processed_objects % 10 == 0:
-                print(f"DEBUG: Processing object {processed_objects}/{len(versions_by_object)}: {object_key}")
-            
-            logger.info(f"Processing object: {object_key} ({total_versions} versions)")
-            
             # Initialize tracking for this object
             self.deletion_status[object_key] = {
                 'total_versions': total_versions,
                 'deleted_versions': 0,
                 'success': False
             }
-            
-            # Delete each version
             for version in versions:
-                success = self.delete_object_version(
-                    bucket_name,
-                    object_key,
-                    version['VersionId'],
-                    version['Type']
-                )
-                
-                if success:
-                    deleted_count += 1
+                all_versions_to_delete.append({
+                    'Key': object_key,
+                    'VersionId': version['VersionId'],
+                    'Type': version['Type']
+                })
+
+        total_versions_count = len(all_versions_to_delete)
+        logger.info(f"Flattened to {total_versions_count} total object versions to delete.")
+
+        if total_versions_count == 0:
+            logger.info("No versions to delete.")
+            return True
+
+        # 2. Batch process in chunks of up to 1000 versions
+        batch_size = 1000
+        total_batches = (total_versions_count + batch_size - 1) // batch_size
+        deleted_versions_count = 0
+
+        for batch_num in range(total_batches):
+            start_idx = batch_num * batch_size
+            end_idx = min(start_idx + batch_size, total_versions_count)
+            current_batch = all_versions_to_delete[start_idx:end_idx]
+
+            logger.info(f"Processing batch {batch_num + 1}/{total_batches} ({len(current_batch)} items)...")
+            if self.debug:
+                print(f"DEBUG: Processing batch {batch_num + 1}/{total_batches} ({len(current_batch)} items)...", flush=True)
+
+            # Dry run logic
+            if self.dry_run:
+                bypass = " [force-bypass governance]" if self.force else ""
+                logger.info(f"[DRY RUN] Would delete batch of {len(current_batch)} object versions{bypass}")
+                for item in current_batch:
+                    key = item['Key']
+                    self.deletion_status[key]['deleted_versions'] += 1
                     self.stats['successfully_deleted_versions'] += 1
-                else:
+                deleted_versions_count += len(current_batch)
+                continue
+
+            # Live execution
+            try:
+                # Format request for boto3
+                delete_payload = {
+                    'Objects': [{'Key': f['Key'], 'VersionId': f['VersionId']} for f in current_batch]
+                }
+
+                params = {
+                    'Bucket': bucket_name,
+                    'Delete': delete_payload
+                }
+                if self.force:
+                    params['BypassGovernanceRetention'] = True
+
+                response = self.s3.delete_objects(**params)
+
+                # Process successes
+                deleted_items = response.get('Deleted', [])
+                for item in deleted_items:
+                    key = item['Key']
+                    self.deletion_status[key]['deleted_versions'] += 1
+                    self.stats['successfully_deleted_versions'] += 1
+                    logger.debug(f"Deleted version: {key} (version: {item.get('VersionId')})")
+
+                deleted_versions_count += len(deleted_items)
+
+                # Process failures
+                error_items = response.get('Errors', [])
+                for err in error_items:
+                    key = err['Key']
+                    version_id = err.get('VersionId', 'Null')
+                    err_msg = f"{err.get('Code')}: {err.get('Message')}"
+                    logger.error(f"Failed to delete: {key} (version: {version_id}) - {err_msg}")
+
                     self.stats['failed_deletions'] += 1
                     all_successful = False
-            
-            # Update tracking
-            self.deletion_status[object_key]['deleted_versions'] = deleted_count
-            self.deletion_status[object_key]['success'] = (deleted_count == total_versions)
-            
-            if self.deletion_status[object_key]['success']:
+
+                    # Find type of version for tracking
+                    version_type = 'Unknown'
+                    for v in current_batch:
+                        if v['Key'] == key and v['VersionId'] == version_id:
+                            version_type = v['Type']
+                            break
+
+                    self.failed_deletions.append({
+                        'key': key,
+                        'version_id': version_id,
+                        'type': version_type,
+                        'error': err_msg
+                    })
+
+            except ClientError as e:
+                logger.error(f"Batch deletion request failed: {e}")
+                all_successful = False
+                for item in current_batch:
+                    key = item['Key']
+                    version_id = item['VersionId']
+                    self.stats['failed_deletions'] += 1
+                    self.failed_deletions.append({
+                        'key': key,
+                        'version_id': version_id,
+                        'type': item['Type'],
+                        'error': str(e)
+                    })
+
+            # Sub-progress status logging
+            if self.debug:
+                print(f"DEBUG: Batch {batch_num + 1}/{total_batches} finished. Total versions deleted: {deleted_versions_count}/{total_versions_count}", flush=True)
+
+        # 3. Update top-level object success status based on all version results
+        for object_key, status in self.deletion_status.items():
+            status['success'] = (status['deleted_versions'] == status['total_versions'])
+            if status['success']:
                 self.stats['successfully_deleted_objects'] += 1
-                logger.info(f"✓ Successfully deleted all {total_versions} versions of {object_key}")
+                logger.info(f"✓ Successfully deleted all {status['total_versions']} versions of {object_key}")
             else:
-                logger.warning(f"✗ Only deleted {deleted_count}/{total_versions} versions of {object_key}")
-        
+                logger.warning(f"✗ Only deleted {status['deleted_versions']}/{status['total_versions']} versions of {object_key}")
+
         return all_successful
 
     def delete_bucket(self, bucket_name):
