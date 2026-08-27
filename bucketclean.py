@@ -346,10 +346,82 @@ class BucketCleanupManager:
                     print(f"DEBUG: Processed {processed_versions} versions...")
             
             return dict(versions_by_object)
-            
+
         except ClientError as e:
             logger.error(f"Error retrieving object versions in bucket {bucket_name}: {e}")
             return {}
+
+    def stream_object_versions_in_batches(self, bucket_name, prefix="", batch_size=1000):
+        """
+        Generator that yields batches of object versions for memory-efficient processing.
+        Each batch is a dict {object_key: [versions]} with up to batch_size total versions.
+
+        This allows processing of arbitrarily large buckets without loading all metadata into memory.
+        """
+        try:
+            paginator = self.s3.get_paginator('list_object_versions')
+            paginate_params = {'Bucket': bucket_name}
+            if prefix:
+                paginate_params['Prefix'] = prefix
+            page_iterator = paginator.paginate(**paginate_params)
+
+            current_batch = defaultdict(list)
+            current_batch_size = 0
+            total_processed = 0
+
+            for page in page_iterator:
+                # Process current versions
+                if 'Versions' in page:
+                    for version in page['Versions']:
+                        current_batch[version['Key']].append({
+                            'VersionId': version['VersionId'],
+                            'IsLatest': version['IsLatest'],
+                            'LastModified': version['LastModified'],
+                            'Size': version['Size'],
+                            'Type': 'Version'
+                        })
+                        current_batch_size += 1
+                        total_processed += 1
+
+                        # Yield batch when it reaches the target size
+                        if current_batch_size >= batch_size:
+                            if self.debug:
+                                print(f"DEBUG: Yielding batch of {current_batch_size} versions (total processed: {total_processed})")
+                            yield dict(current_batch)
+                            current_batch = defaultdict(list)
+                            current_batch_size = 0
+
+                # Process delete markers
+                if 'DeleteMarkers' in page:
+                    for delete_marker in page['DeleteMarkers']:
+                        current_batch[delete_marker['Key']].append({
+                            'VersionId': delete_marker['VersionId'],
+                            'IsLatest': delete_marker['IsLatest'],
+                            'LastModified': delete_marker['LastModified'],
+                            'Size': 0,
+                            'Type': 'DeleteMarker'
+                        })
+                        current_batch_size += 1
+                        total_processed += 1
+
+                        # Yield batch when it reaches the target size
+                        if current_batch_size >= batch_size:
+                            if self.debug:
+                                print(f"DEBUG: Yielding batch of {current_batch_size} versions (total processed: {total_processed})")
+                            yield dict(current_batch)
+                            current_batch = defaultdict(list)
+                            current_batch_size = 0
+
+            # Yield any remaining versions in the final partial batch
+            if current_batch_size > 0:
+                if self.debug:
+                    print(f"DEBUG: Yielding final batch of {current_batch_size} versions (total processed: {total_processed})")
+                yield dict(current_batch)
+
+        except ClientError as e:
+            logger.error(f"Error streaming object versions in bucket {bucket_name}: {e}")
+            # Yield empty dict to allow graceful handling
+            return
 
     def check_bucket_compliance_locks(self, bucket_name, versions_by_object):
         """
@@ -449,6 +521,100 @@ class BucketCleanupManager:
             return False
         
         logger.info(f"✓ Checked {checked_count} object versions - no blocking compliance locks found")
+        return True
+
+    def check_batch_compliance_locks(self, bucket_name, versions_batch, object_lock_config):
+        """
+        Check compliance locks for one batch of object versions.
+
+        Args:
+            bucket_name: Name of the S3 bucket
+            versions_batch: Dict of {object_key: [versions]} for this batch
+            object_lock_config: Result from check_bucket_object_lock_configuration()
+
+        Returns:
+            bool: True if batch can be deleted, False if blocking locks found
+        """
+        if not object_lock_config['enabled']:
+            # No Object Lock means no compliance issues
+            if self.debug:
+                print("DEBUG: Batch has no Object Lock - skipping compliance checks")
+            return True
+
+        # Object Lock is enabled - check individual objects in this batch
+        future_locked_objects = []
+        past_locked_objects = []
+        checked_count = 0
+        total_to_check = sum(len(versions) for versions in versions_batch.values())
+
+        if self.debug:
+            print(f"DEBUG: Checking compliance locks for batch of {total_to_check} versions...")
+
+        default_mode = (
+            object_lock_config['configuration']
+            .get('Rule', {}).get('DefaultRetention', {}).get('Mode', 'UNKNOWN')
+        )
+
+        for object_key, versions in versions_batch.items():
+            for version in versions:
+                compliance_info = self.check_compliance_lock(
+                    bucket_name, object_key, version['VersionId']
+                )
+
+                # StorageGrid fallback: per-object retention unavailable, use bucket default
+                if compliance_info['locked'] == 'use_bucket_default':
+                    is_locked, retention_until = self._calc_default_retention_expiry(
+                        version['LastModified'], object_lock_config['configuration']
+                    )
+                    compliance_info = {
+                        'locked': is_locked,
+                        'retention_until': retention_until,
+                        'can_delete': not is_locked,
+                        'mode': default_mode
+                    }
+                    if self.debug:
+                        print(f"DEBUG: Used bucket-default retention for {object_key} "
+                              f"(version {version['VersionId'][:8]}...) "
+                              f"- locked: {is_locked}, expires: {retention_until}")
+
+                checked_count += 1
+
+                if compliance_info['locked']:
+                    self.stats['compliance_locked_count'] += 1
+
+                    if not compliance_info['can_delete']:
+                        mode = compliance_info.get('mode', 'UNKNOWN')
+                        if self.force and mode == 'GOVERNANCE':
+                            logger.info(f"Force-bypassing governance lock: {object_key} (version: {version['VersionId']})")
+                        else:
+                            future_locked_objects.append({
+                                'key': object_key,
+                                'version_id': version['VersionId'],
+                                'retention_until': compliance_info['retention_until'],
+                                'mode': mode
+                            })
+                    else:
+                        past_locked_objects.append({
+                            'key': object_key,
+                            'version_id': version['VersionId'],
+                            'retention_until': compliance_info['retention_until']
+                        })
+
+        # Log results for this batch
+        if past_locked_objects:
+            logger.info(f"Batch: {len(past_locked_objects)} objects with expired compliance locks (can be deleted)")
+
+        if future_locked_objects:
+            logger.error(f"Batch: Found {len(future_locked_objects)} objects with active compliance locks (CANNOT be deleted)")
+            for obj in future_locked_objects:
+                logger.error(f"Active lock: {obj['key']} (version: {obj['version_id']}, expires: {obj['retention_until']}, mode: {obj['mode']})")
+
+            # Accumulate blocked objects across batches
+            self.compliance_locked_objects.extend(future_locked_objects)
+            return False
+
+        if self.debug:
+            print(f"DEBUG: Checked {checked_count} versions in batch - no blocking locks")
         return True
 
     def delete_object_version(self, bucket_name, object_key, version_id, version_type):
@@ -847,41 +1013,69 @@ def main(bucket_name, endpoint_url, profile_name=None, access_key=None, secret_k
             cleanup_manager.print_summary(bucket_name, start_time, end_time)
         return True
     
-    # Step 3: Get all object versions
+    # Step 3: Check bucket-level Object Lock configuration (once, before streaming)
     if debug:
-        print("DEBUG: Retrieving all object versions...", flush=True)
-    logger.info("Retrieving all object versions...")
-    versions_by_object = cleanup_manager.get_all_object_versions(bucket_name, prefix)
-    total_versions = sum(len(versions) for versions in versions_by_object.values())
-    cleanup_manager.stats['total_versions'] = total_versions
-    logger.info(f"✓ Found {total_versions} total versions across all objects")
-    
-    # Step 4: Check compliance locks (optimized)
-    if debug:
-        print("DEBUG: Checking Object Lock configuration and compliance locks...", flush=True)
-    
-    can_proceed = cleanup_manager.check_bucket_compliance_locks(bucket_name, versions_by_object)
-    
-    if not can_proceed:
-        logger.error("✗ ABORTING: Found objects with active compliance locks that prevent deletion")
+        print("DEBUG: Checking bucket Object Lock configuration...", flush=True)
+    logger.info("Checking bucket Object Lock configuration...")
+
+    try:
+        object_lock_config = cleanup_manager.check_bucket_object_lock_configuration(bucket_name)
+    except ClientError as e:
+        logger.error(f"✗ Cannot determine Object Lock status for bucket {bucket_name}: {e}. Aborting to be safe.")
         end_time = time.time()
         if debug:
             cleanup_manager.print_summary(bucket_name, start_time, end_time)
         return False
-    
-    logger.info("✓ No blocking compliance locks found, proceeding with deletion")
-    
-    # Step 5: Delete all object versions
-    if not dry_run:
-        logger.info("Starting object deletion process...")
-        if debug:
-            print("DEBUG: Starting object deletion process...", flush=True)
+
+    if object_lock_config['enabled']:
+        logger.info("Bucket has Object Lock enabled - will check compliance locks per batch")
     else:
-        logger.info("DRY RUN: Simulating object deletion process...")
+        logger.info("✓ Bucket has no Object Lock configuration - no compliance locks to check")
+
+    # Step 4: Stream, check, and delete in batches (memory-efficient)
+    if not dry_run:
+        logger.info("Starting streaming batch processing with deletion...")
+    else:
+        logger.info("DRY RUN: Starting streaming batch processing (simulation)...")
+
+    if debug:
+        print("DEBUG: Processing bucket in streaming batches of 1000 versions...", flush=True)
+
+    batch_num = 0
+    all_deleted = True
+    total_versions_processed = 0
+
+    for batch in cleanup_manager.stream_object_versions_in_batches(bucket_name, prefix, batch_size=1000):
+        batch_num += 1
+        batch_size = sum(len(versions) for versions in batch.values())
+        total_versions_processed += batch_size
+
         if debug:
-            print("DEBUG: DRY RUN: Simulating object deletion process...", flush=True)
-    
-    all_deleted = cleanup_manager.cleanup_object_versions(bucket_name, versions_by_object)
+            print(f"DEBUG: Processing batch {batch_num} ({batch_size} versions)...", flush=True)
+        logger.info(f"Processing batch {batch_num} ({batch_size} versions, cumulative: {total_versions_processed})...")
+
+        # Check compliance locks for this batch
+        can_proceed = cleanup_manager.check_batch_compliance_locks(bucket_name, batch, object_lock_config)
+
+        if not can_proceed:
+            logger.error(f"✗ ABORTING at batch {batch_num}: Found objects with active compliance locks that prevent deletion")
+            all_deleted = False
+            break
+
+        # Delete this batch
+        batch_deleted = cleanup_manager.cleanup_object_versions(bucket_name, batch)
+        if not batch_deleted:
+            all_deleted = False
+            logger.warning(f"⚠ Batch {batch_num} had deletion failures")
+
+    # Update final stats
+    cleanup_manager.stats['total_versions'] = total_versions_processed
+    cleanup_manager.stats['total_objects'] = len(cleanup_manager.deletion_status)
+
+    if all_deleted:
+        logger.info(f"✓ Successfully processed {batch_num} batches ({total_versions_processed} total versions)")
+    else:
+        logger.warning(f"⚠ Processed {batch_num} batches with some failures ({total_versions_processed} total versions)")
     
     # Step 6: Delete bucket if all objects were successfully removed
     if all_deleted and not dry_run and delete_bucket:
