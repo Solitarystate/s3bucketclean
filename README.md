@@ -85,6 +85,7 @@ To contribute to this project:
 ## Disclaimer
 
 These scripts are provided as-is. Please test thoroughly in non-production environments before deploying. Ensure compliance with your organization's policies and security requirements.
+Note: I've been using Claude for assistance in refining some functionalities and improving documentation of this script even though I wrote it initially. There are strong opinions on using AI tools. I respect it. 
 
 ## License
 
