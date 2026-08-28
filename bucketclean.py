@@ -13,11 +13,70 @@ from collections import defaultdict
 import json
 import os
 import sys
+import signal
 from pathlib import Path
 
 LOG_PATH = "/var/log/storagegrid/bucketclean.log"
 URL_ENDPOINT_OSL = "https://ep.s3-no.basefarm-orange.com"
 URL_ENDPOINT_STH = "https://ep.s3-se.basefarm-orange.com"
+
+# Global flag for interrupt handling
+interrupt_received = False
+
+class InterruptHandler:
+    """Handle SIGINT (Ctrl+C) and SIGTERM gracefully."""
+
+    def __init__(self):
+        self.interrupted = False
+        self.original_sigint = signal.getsignal(signal.SIGINT)
+        self.original_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def __enter__(self):
+        """Set up signal handlers."""
+        signal.signal(signal.SIGINT, self._handle_interrupt)
+        signal.signal(signal.SIGTERM, self._handle_interrupt)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Restore original signal handlers."""
+        signal.signal(signal.SIGINT, self.original_sigint)
+        signal.signal(signal.SIGTERM, self.original_sigterm)
+        return False
+
+    def _handle_interrupt(self, signum, frame):
+        """Handle interrupt signals gracefully."""
+        global interrupt_received
+        if not self.interrupted:
+            self.interrupted = True
+            interrupt_received = True
+            signal_name = "SIGINT" if signum == signal.SIGINT else "SIGTERM"
+            print(f"\n\n{'='*80}", flush=True)
+            print(f"⚠ {signal_name} received - Gracefully shutting down...", flush=True)
+            print(f"Finishing current batch and saving progress...", flush=True)
+            print(f"{'='*80}\n", flush=True)
+            # Log to file if logger is available
+            try:
+                import logging
+                logger = logging.getLogger(__name__)
+                if logger.hasHandlers():
+                    logger.warning(f"{signal_name} received - initiating graceful shutdown")
+            except:
+                pass
+        else:
+            # Second interrupt - force exit
+            print(f"\n⚠ Second interrupt received - forcing immediate exit", flush=True)
+            try:
+                import logging
+                logger = logging.getLogger(__name__)
+                if logger.hasHandlers():
+                    logger.error("Second interrupt - forcing immediate exit")
+            except:
+                pass
+            sys.exit(1)
+
+    def check(self):
+        """Check if interrupt was received."""
+        return self.interrupted
 
 class BucketCleanupManager:
     def __init__(self, endpoint_url, profile_name=None, access_key=None, secret_key=None, debug=False, dry_run=False, force=False):
@@ -1044,60 +1103,85 @@ def main(bucket_name, endpoint_url, profile_name=None, access_key=None, secret_k
     batch_num = 0
     all_deleted = True
     total_versions_processed = 0
+    interrupted = False
 
-    for batch in cleanup_manager.stream_object_versions_in_batches(bucket_name, prefix, batch_size=1000):
-        batch_num += 1
-        batch_size = sum(len(versions) for versions in batch.values())
-        total_versions_processed += batch_size
+    # Set up interrupt handler
+    with InterruptHandler() as interrupt_handler:
+        for batch in cleanup_manager.stream_object_versions_in_batches(bucket_name, prefix, batch_size=1000):
+            # Check for interrupt before processing next batch
+            if interrupt_handler.check():
+                interrupted = True
+                logger.warning(f"⚠ Interrupt received after processing {batch_num} batches")
+                print(f"\n⚠ Interrupt received. Processed {batch_num} batches so far.", flush=True)
+                print(f"Partial progress has been saved. Exiting gracefully...\n", flush=True)
+                break
 
-        if debug:
-            print(f"DEBUG: Processing batch {batch_num} ({batch_size} versions)...", flush=True)
-        logger.info(f"Processing batch {batch_num} ({batch_size} versions, cumulative: {total_versions_processed})...")
+            batch_num += 1
+            batch_size = sum(len(versions) for versions in batch.values())
+            total_versions_processed += batch_size
 
-        # Check compliance locks for this batch
-        can_proceed = cleanup_manager.check_batch_compliance_locks(bucket_name, batch, object_lock_config)
+            if debug:
+                print(f"DEBUG: Processing batch {batch_num} ({batch_size} versions)...", flush=True)
+            logger.info(f"Processing batch {batch_num} ({batch_size} versions, cumulative: {total_versions_processed})...")
 
-        if not can_proceed:
-            logger.error(f"✗ ABORTING at batch {batch_num}: Found objects with active compliance locks that prevent deletion")
-            all_deleted = False
-            break
+            # Check compliance locks for this batch
+            can_proceed = cleanup_manager.check_batch_compliance_locks(bucket_name, batch, object_lock_config)
 
-        # Delete this batch
-        batch_deleted = cleanup_manager.cleanup_object_versions(bucket_name, batch)
-        if not batch_deleted:
-            all_deleted = False
-            logger.warning(f"⚠ Batch {batch_num} had deletion failures")
+            if not can_proceed:
+                logger.error(f"✗ ABORTING at batch {batch_num}: Found objects with active compliance locks that prevent deletion")
+                all_deleted = False
+                break
+
+            # Delete this batch
+            batch_deleted = cleanup_manager.cleanup_object_versions(bucket_name, batch)
+            if not batch_deleted:
+                all_deleted = False
+                logger.warning(f"⚠ Batch {batch_num} had deletion failures")
 
     # Update final stats
     cleanup_manager.stats['total_versions'] = total_versions_processed
     cleanup_manager.stats['total_objects'] = len(cleanup_manager.deletion_status)
 
-    if all_deleted:
+    if interrupted:
+        logger.warning(f"⚠ INTERRUPTED: Processed {batch_num} batches ({total_versions_processed} versions) before interrupt")
+        print(f"\n{'='*80}", flush=True)
+        print(f"⚠ PARTIAL COMPLETION - Interrupted by user", flush=True)
+        print(f"{'='*80}", flush=True)
+        print(f"Batches processed: {batch_num}", flush=True)
+        print(f"Versions processed: {total_versions_processed}", flush=True)
+        print(f"Objects processed: {len(cleanup_manager.deletion_status)}", flush=True)
+        print(f"{'='*80}\n", flush=True)
+    elif all_deleted:
         logger.info(f"✓ Successfully processed {batch_num} batches ({total_versions_processed} total versions)")
     else:
         logger.warning(f"⚠ Processed {batch_num} batches with some failures ({total_versions_processed} total versions)")
-    
+
     # Step 6: Delete bucket if all objects were successfully removed
-    if all_deleted and not dry_run and delete_bucket:
+    if not interrupted and all_deleted and not dry_run and delete_bucket:
         logger.info("All objects deleted successfully, attempting to delete bucket...")
         bucket_deleted = cleanup_manager.delete_bucket(bucket_name)
     else:
         bucket_deleted = False
-        if not all_deleted:
+        if interrupted:
+            logger.info("Bucket deletion skipped due to interrupt")
+        elif not all_deleted:
             logger.warning("Not all objects were deleted successfully, skipping bucket deletion")
         elif dry_run:
             logger.info("DRY RUN: Would attempt to delete bucket")
         elif not delete_bucket:
             logger.info("--delete-bucket not specified, skipping bucket deletion")
-    
+
     end_time = time.time()
-    
+
     # Step 7: Print summary
-    if debug:
+    if debug or interrupted:
         cleanup_manager.print_summary(bucket_name, start_time, end_time)
-    
+
     # Final status
-    if all_deleted and (bucket_deleted or dry_run or not delete_bucket):
+    if interrupted:
+        logger.warning("⚠ Bucket cleanup interrupted by user - partial progress saved")
+        return False
+    elif all_deleted and (bucket_deleted or dry_run or not delete_bucket):
         logger.info("✓ Bucket cleanup completed successfully")
         return True
     else:

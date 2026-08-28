@@ -9,3 +9,4 @@ IMPLEMENTATION_SUMMARY.md
 .vscode/
 
 venv/
+test_interrupt_handling.py
