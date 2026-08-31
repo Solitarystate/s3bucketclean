@@ -10,3 +10,4 @@ IMPLEMENTATION_SUMMARY.md
 
 venv/
 test_interrupt_handling.py
+test_progress_indicator.py

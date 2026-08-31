@@ -78,6 +78,134 @@ class InterruptHandler:
         """Check if interrupt was received."""
         return self.interrupted
 
+class ProgressIndicator:
+    """Display progress updates during batch processing."""
+
+    def __init__(self, estimated_total_objects=None, batch_size=1000, show_progress=True):
+        """
+        Initialize progress indicator.
+
+        Args:
+            estimated_total_objects: Estimated total number of objects (for percentage calculation)
+            batch_size: Size of each batch
+            show_progress: Whether to show progress updates
+        """
+        self.estimated_total_objects = estimated_total_objects
+        self.batch_size = batch_size
+        self.show_progress = show_progress
+        self.start_time = time.time()
+        self.last_update_time = self.start_time
+        self.batches_processed = 0
+        self.total_versions_processed = 0
+        self.total_objects_processed = 0
+        self.last_progress_line_length = 0
+
+    def update(self, batch_num, batch_size, total_versions, total_objects):
+        """
+        Update progress after processing a batch.
+
+        Args:
+            batch_num: Current batch number
+            batch_size: Number of versions in this batch
+            total_versions: Total versions processed so far
+            total_objects: Total unique objects processed so far
+        """
+        if not self.show_progress:
+            return
+
+        self.batches_processed = batch_num
+        self.total_versions_processed = total_versions
+        self.total_objects_processed = total_objects
+
+        # Calculate statistics
+        elapsed = time.time() - self.start_time
+        rate = total_versions / elapsed if elapsed > 0 else 0
+
+        # Estimate progress
+        progress_str = ""
+        eta_str = ""
+
+        if self.estimated_total_objects and self.estimated_total_objects > 0:
+            progress_pct = (total_objects / self.estimated_total_objects) * 100
+            progress_str = f" ({progress_pct:.1f}%)"
+
+            # Estimate time remaining
+            if rate > 0:
+                versions_remaining = self.estimated_total_objects - total_versions
+                eta_seconds = versions_remaining / rate
+                eta_str = self._format_time(eta_seconds)
+
+        # Format elapsed time
+        elapsed_str = self._format_time(elapsed)
+
+        # Build progress message
+        msg = (f"[Batch {batch_num}] "
+               f"Processed: {total_objects:,} objects ({total_versions:,} versions){progress_str} | "
+               f"Rate: {rate:.1f} versions/sec | "
+               f"Elapsed: {elapsed_str}")
+
+        if eta_str:
+            msg += f" | ETA: {eta_str}"
+
+        # Check if terminal supports carriage return (interactive terminal)
+        # Print updates on new line every 5 batches for better visibility and compatibility
+        if batch_num % 5 == 0 or batch_num == 1:
+            # Clear previous line if we were using carriage return
+            if self.last_progress_line_length > 0:
+                print(f"\r{' ' * self.last_progress_line_length}\r", end='', flush=True)
+            # Print on new line
+            print(msg, flush=True)
+            self.last_progress_line_length = 0
+        else:
+            # Try carriage return for in-between updates
+            print(f"\r{msg}", end='', flush=True)
+            self.last_progress_line_length = len(msg)
+
+    def finish(self, success=True, interrupted=False):
+        """
+        Print final progress summary.
+
+        Args:
+            success: Whether processing completed successfully
+            interrupted: Whether processing was interrupted
+        """
+        if not self.show_progress:
+            return
+
+        # Clear the progress line
+        print(f"\r{' ' * self.last_progress_line_length}\r", end='', flush=True)
+
+        elapsed = time.time() - self.start_time
+        elapsed_str = self._format_time(elapsed)
+        rate = self.total_versions_processed / elapsed if elapsed > 0 else 0
+
+        # Print final summary
+        if interrupted:
+            status = "⚠ INTERRUPTED"
+        elif success:
+            status = "✓ COMPLETED"
+        else:
+            status = "⚠ COMPLETED WITH ERRORS"
+
+        print(f"\n{status}: Processed {self.batches_processed} batches", flush=True)
+        print(f"  Objects: {self.total_objects_processed:,}", flush=True)
+        print(f"  Versions: {self.total_versions_processed:,}", flush=True)
+        print(f"  Time: {elapsed_str}", flush=True)
+        print(f"  Average rate: {rate:.1f} versions/sec\n", flush=True)
+
+    def _format_time(self, seconds):
+        """Format seconds into human-readable time string."""
+        if seconds < 60:
+            return f"{int(seconds)}s"
+        elif seconds < 3600:
+            mins = int(seconds // 60)
+            secs = int(seconds % 60)
+            return f"{mins}m {secs}s"
+        else:
+            hours = int(seconds // 3600)
+            mins = int((seconds % 3600) // 60)
+            return f"{hours}h {mins}m"
+
 class BucketCleanupManager:
     def __init__(self, endpoint_url, profile_name=None, access_key=None, secret_key=None, debug=False, dry_run=False, force=False):
         self.endpoint_url = endpoint_url
@@ -1105,6 +1233,13 @@ def main(bucket_name, endpoint_url, profile_name=None, access_key=None, secret_k
     total_versions_processed = 0
     interrupted = False
 
+    # Initialize progress indicator (always show unless explicitly disabled)
+    progress = ProgressIndicator(
+        estimated_total_objects=object_count,
+        batch_size=1000,
+        show_progress=True  # Always show progress updates
+    )
+
     # Set up interrupt handler
     with InterruptHandler() as interrupt_handler:
         for batch in cleanup_manager.stream_object_versions_in_batches(bucket_name, prefix, batch_size=1000):
@@ -1112,8 +1247,7 @@ def main(bucket_name, endpoint_url, profile_name=None, access_key=None, secret_k
             if interrupt_handler.check():
                 interrupted = True
                 logger.warning(f"⚠ Interrupt received after processing {batch_num} batches")
-                print(f"\n⚠ Interrupt received. Processed {batch_num} batches so far.", flush=True)
-                print(f"Partial progress has been saved. Exiting gracefully...\n", flush=True)
+                progress.finish(success=False, interrupted=True)
                 break
 
             batch_num += 1
@@ -1130,6 +1264,7 @@ def main(bucket_name, endpoint_url, profile_name=None, access_key=None, secret_k
             if not can_proceed:
                 logger.error(f"✗ ABORTING at batch {batch_num}: Found objects with active compliance locks that prevent deletion")
                 all_deleted = False
+                progress.finish(success=False, interrupted=False)
                 break
 
             # Delete this batch
@@ -1137,6 +1272,20 @@ def main(bucket_name, endpoint_url, profile_name=None, access_key=None, secret_k
             if not batch_deleted:
                 all_deleted = False
                 logger.warning(f"⚠ Batch {batch_num} had deletion failures")
+
+            # Update progress indicator
+            progress.update(
+                batch_num=batch_num,
+                batch_size=batch_size,
+                total_versions=total_versions_processed,
+                total_objects=len(cleanup_manager.deletion_status)
+            )
+
+    # Finish progress display
+    if not interrupted and all_deleted:
+        progress.finish(success=True, interrupted=False)
+    elif not interrupted:
+        progress.finish(success=False, interrupted=False)
 
     # Update final stats
     cleanup_manager.stats['total_versions'] = total_versions_processed
