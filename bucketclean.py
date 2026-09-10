@@ -813,7 +813,7 @@ class BucketCleanupManager:
             print(f"DEBUG: Checked {checked_count} versions in batch - no blocking locks")
         return True
 
-    def _process_batch_worker(self, bucket_name, batch, batch_num, object_lock_config, progress, abort_event):
+    def _process_batch_worker(self, bucket_name, batch, batch_num, object_lock_config, abort_event):
         """
         Worker method to process one batch: check compliance locks and delete.
         Thread-safe. Returns (success, batch_size).
