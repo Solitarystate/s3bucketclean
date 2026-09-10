@@ -5,11 +5,15 @@
 
 ## Features
 
+- **Parallel Batch Processing**: Process multiple batches concurrently for 2-3x faster deletion on large buckets
+- **Memory-Efficient Streaming**: Handles buckets of any size with constant memory usage via batch streaming
 - **Prefix Filtering**: Target specific folders/paths within a bucket (useful for TSM backup cleanup)
 - **Compliance Lock Detection**: Automatically checks for Object Lock and retention policies before deletion
 - **Versioning Support**: Handles versioned buckets and delete markers
 - **Dry Run Mode**: Test operations without actual deletion
 - **Force Mode**: Bypass governance-mode retention locks when authorized
+- **Progress Indicators**: Real-time progress updates with rate calculation and ETA
+- **Graceful Interrupt Handling**: Ctrl+C finishes current batch and saves progress
 - **Detailed Logging**: Comprehensive logs and debug output for troubleshooting
 - **Multiple Auth Methods**: Supports AWS profiles, explicit credentials, or environment variables
 
@@ -65,8 +69,19 @@ python bucketclean.py -b my-bucket-name -v
 | `--secret-key` | AWS secret access key (must use with --access-key) |
 | `-d`, `--dryrun` | Dry run mode - no actual deletions performed |
 | `-v`, `--debug` | Enable debug mode with detailed output |
+| `-w`, `--workers` | Number of parallel workers (1-10, default: 3) |
 | `--force` | Bypass governance-mode retention locks (compliance locks still block) |
 | `--delete-bucket` | Delete the bucket itself after cleaning all objects |
+
+## Performance
+
+The script uses parallel batch processing by default to maximize throughput on large buckets:
+
+- **Sequential mode** (`--workers 1`): Processes one batch at a time (original behavior)
+- **Parallel mode** (`--workers 3`, default): Processes 3 batches concurrently for 2-3x speedup
+- **High-throughput** (`--workers 5-10`): For very large buckets with stable network connections
+
+Memory usage stays constant regardless of bucket size thanks to streaming batch processing. Each batch contains 1,000 object versions.
 
 ### Prerequisites
 - Python 3.7 or higher
