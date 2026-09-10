@@ -14,6 +14,9 @@ import json
 import os
 import sys
 import signal
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
 from pathlib import Path
 
 LOG_PATH = "/var/log/storagegrid/bucketclean.log"
@@ -212,10 +215,13 @@ class BucketCleanupManager:
         self.debug = debug
         self.dry_run = dry_run
         self.force = force
-        
+
         # Initialize S3 client with credentials
         self.s3 = self._initialize_s3_client(endpoint_url, profile_name, access_key, secret_key)
-        
+
+        # Thread safety lock for shared state
+        self._lock = threading.Lock()
+
         # Tracking dictionaries
         self.deletion_status = {}
         self.compliance_locked_objects = []
@@ -671,10 +677,11 @@ class BucketCleanupManager:
                 checked_count += 1
                 if checked_count % 100 == 0 and self.debug:
                     print(f"DEBUG: Checked compliance locks for {checked_count}/{total_to_check} versions...")
-                
+
                 if compliance_info['locked']:
-                    self.stats['compliance_locked_count'] += 1
-                    
+                    with self._lock:
+                        self.stats['compliance_locked_count'] += 1
+
                     if not compliance_info['can_delete']:
                         mode = compliance_info.get('mode', 'UNKNOWN')
                         if self.force and mode == 'GOVERNANCE':
@@ -767,7 +774,8 @@ class BucketCleanupManager:
                 checked_count += 1
 
                 if compliance_info['locked']:
-                    self.stats['compliance_locked_count'] += 1
+                    with self._lock:
+                        self.stats['compliance_locked_count'] += 1
 
                     if not compliance_info['can_delete']:
                         mode = compliance_info.get('mode', 'UNKNOWN')
@@ -796,13 +804,55 @@ class BucketCleanupManager:
             for obj in future_locked_objects:
                 logger.error(f"Active lock: {obj['key']} (version: {obj['version_id']}, expires: {obj['retention_until']}, mode: {obj['mode']})")
 
-            # Accumulate blocked objects across batches
-            self.compliance_locked_objects.extend(future_locked_objects)
+            # Accumulate blocked objects across batches (thread-safe)
+            with self._lock:
+                self.compliance_locked_objects.extend(future_locked_objects)
             return False
 
         if self.debug:
             print(f"DEBUG: Checked {checked_count} versions in batch - no blocking locks")
         return True
+
+    def _process_batch_worker(self, bucket_name, batch, batch_num, object_lock_config, progress, abort_event):
+        """
+        Worker method to process one batch: check compliance locks and delete.
+        Thread-safe. Returns (success, batch_size).
+
+        Args:
+            bucket_name: Name of the S3 bucket
+            batch: Dict of {object_key: [versions]} for this batch
+            batch_num: Batch number (for logging)
+            object_lock_config: Bucket-level Object Lock configuration
+            progress: ProgressIndicator instance (thread-safe)
+            abort_event: threading.Event to signal abort on compliance lock
+
+        Returns:
+            tuple: (success: bool, batch_size: int)
+        """
+        # Check if we should abort (compliance lock hit by another worker)
+        if abort_event.is_set():
+            if self.debug:
+                print(f"DEBUG: Batch {batch_num} skipped due to abort signal", flush=True)
+            return False, 0
+
+        batch_size = sum(len(versions) for versions in batch.values())
+
+        if self.debug:
+            print(f"DEBUG: Worker processing batch {batch_num} ({batch_size} versions)...", flush=True)
+        logger.info(f"Processing batch {batch_num} ({batch_size} versions)...")
+
+        # Check compliance locks for this batch
+        can_proceed = self.check_batch_compliance_locks(bucket_name, batch, object_lock_config)
+
+        if not can_proceed:
+            logger.error(f"✗ Batch {batch_num}: Found objects with active compliance locks that prevent deletion")
+            abort_event.set()  # Signal other workers to stop
+            return False, batch_size
+
+        # Delete this batch
+        batch_deleted = self.cleanup_object_versions(bucket_name, batch)
+
+        return batch_deleted, batch_size
 
     def delete_object_version(self, bucket_name, object_key, version_id, version_type):
         """Delete a specific version of an object."""
@@ -839,12 +889,13 @@ class BucketCleanupManager:
         all_versions_to_delete = []
         for object_key, versions in versions_by_object.items():
             total_versions = len(versions)
-            # Initialize tracking for this object
-            self.deletion_status[object_key] = {
-                'total_versions': total_versions,
-                'deleted_versions': 0,
-                'success': False
-            }
+            # Initialize tracking for this object (thread-safe)
+            with self._lock:
+                self.deletion_status[object_key] = {
+                    'total_versions': total_versions,
+                    'deleted_versions': 0,
+                    'success': False
+                }
             for version in versions:
                 all_versions_to_delete.append({
                     'Key': object_key,
@@ -900,67 +951,71 @@ class BucketCleanupManager:
 
                 response = self.s3.delete_objects(**params)
 
-                # Process successes
+                # Process successes (thread-safe)
                 deleted_items = response.get('Deleted', [])
-                for item in deleted_items:
-                    key = item['Key']
-                    self.deletion_status[key]['deleted_versions'] += 1
-                    self.stats['successfully_deleted_versions'] += 1
-                    logger.debug(f"Deleted version: {key} (version: {item.get('VersionId')})")
+                with self._lock:
+                    for item in deleted_items:
+                        key = item['Key']
+                        self.deletion_status[key]['deleted_versions'] += 1
+                        self.stats['successfully_deleted_versions'] += 1
+                        logger.debug(f"Deleted version: {key} (version: {item.get('VersionId')})")
 
                 deleted_versions_count += len(deleted_items)
 
-                # Process failures
+                # Process failures (thread-safe)
                 error_items = response.get('Errors', [])
-                for err in error_items:
-                    key = err['Key']
-                    version_id = err.get('VersionId', 'Null')
-                    err_msg = f"{err.get('Code')}: {err.get('Message')}"
-                    logger.error(f"Failed to delete: {key} (version: {version_id}) - {err_msg}")
+                with self._lock:
+                    for err in error_items:
+                        key = err['Key']
+                        version_id = err.get('VersionId', 'Null')
+                        err_msg = f"{err.get('Code')}: {err.get('Message')}"
+                        logger.error(f"Failed to delete: {key} (version: {version_id}) - {err_msg}")
 
-                    self.stats['failed_deletions'] += 1
-                    all_successful = False
+                        self.stats['failed_deletions'] += 1
+                        all_successful = False
 
-                    # Find type of version for tracking
-                    version_type = 'Unknown'
-                    for v in current_batch:
-                        if v['Key'] == key and v['VersionId'] == version_id:
-                            version_type = v['Type']
-                            break
+                        # Find type of version for tracking
+                        version_type = 'Unknown'
+                        for v in current_batch:
+                            if v['Key'] == key and v['VersionId'] == version_id:
+                                version_type = v['Type']
+                                break
 
-                    self.failed_deletions.append({
-                        'key': key,
-                        'version_id': version_id,
-                        'type': version_type,
-                        'error': err_msg
-                    })
+                        self.failed_deletions.append({
+                            'key': key,
+                            'version_id': version_id,
+                            'type': version_type,
+                            'error': err_msg
+                        })
 
             except ClientError as e:
                 logger.error(f"Batch deletion request failed: {e}")
                 all_successful = False
-                for item in current_batch:
-                    key = item['Key']
-                    version_id = item['VersionId']
-                    self.stats['failed_deletions'] += 1
-                    self.failed_deletions.append({
-                        'key': key,
-                        'version_id': version_id,
-                        'type': item['Type'],
-                        'error': str(e)
-                    })
+                with self._lock:
+                    for item in current_batch:
+                        key = item['Key']
+                        version_id = item['VersionId']
+                        self.stats['failed_deletions'] += 1
+                        self.failed_deletions.append({
+                            'key': key,
+                            'version_id': version_id,
+                            'type': item['Type'],
+                            'error': str(e)
+                        })
 
             # Sub-progress status logging
             if self.debug:
                 print(f"DEBUG: Batch {batch_num + 1}/{total_batches} finished. Total versions deleted: {deleted_versions_count}/{total_versions_count}", flush=True)
 
         # 3. Update top-level object success status based on all version results
-        for object_key, status in self.deletion_status.items():
-            status['success'] = (status['deleted_versions'] == status['total_versions'])
-            if status['success']:
-                self.stats['successfully_deleted_objects'] += 1
-                logger.info(f"✓ Successfully deleted all {status['total_versions']} versions of {object_key}")
-            else:
-                logger.warning(f"✗ Only deleted {status['deleted_versions']}/{status['total_versions']} versions of {object_key}")
+        with self._lock:
+            for object_key, status in self.deletion_status.items():
+                status['success'] = (status['deleted_versions'] == status['total_versions'])
+                if status['success']:
+                    self.stats['successfully_deleted_objects'] += 1
+                    logger.info(f"✓ Successfully deleted all {status['total_versions']} versions of {object_key}")
+                else:
+                    logger.warning(f"✗ Only deleted {status['deleted_versions']}/{status['total_versions']} versions of {object_key}")
 
         return all_successful
 
@@ -1120,7 +1175,7 @@ def debug_aws_configuration():
     debug_text = "\n".join(debug_output)
     print(debug_text, flush=True)
 
-def main(bucket_name, endpoint_url, profile_name=None, access_key=None, secret_key=None, debug=False, dry_run=False, delete_bucket=False, force=False, prefix=""):
+def main(bucket_name, endpoint_url, profile_name=None, access_key=None, secret_key=None, debug=False, dry_run=False, delete_bucket=False, force=False, prefix="", workers=3):
     """Main function to clean up the specified bucket."""
     start_time = time.time()
 
@@ -1219,67 +1274,122 @@ def main(bucket_name, endpoint_url, profile_name=None, access_key=None, secret_k
     else:
         logger.info("✓ Bucket has no Object Lock configuration - no compliance locks to check")
 
-    # Step 4: Stream, check, and delete in batches (memory-efficient)
-    if not dry_run:
-        logger.info("Starting streaming batch processing with deletion...")
+    # Step 4: Stream, check, and delete in batches
+    if workers > 1:
+        logger.info(f"Starting parallel batch processing with {workers} workers...")
     else:
-        logger.info("DRY RUN: Starting streaming batch processing (simulation)...")
+        logger.info("Starting sequential batch processing...")
+
+    if not dry_run:
+        logger.info("with deletion...")
+    else:
+        logger.info("DRY RUN: (simulation)...")
 
     if debug:
-        print("DEBUG: Processing bucket in streaming batches of 1000 versions...", flush=True)
+        print(f"DEBUG: Processing bucket in streaming batches of 1000 versions (workers={workers})...", flush=True)
 
     batch_num = 0
     all_deleted = True
-    total_versions_processed = 0
+    total_versions_processed = [0]  # Mutable list for thread-safe counter
     interrupted = False
+    abort_event = threading.Event()  # Shared abort signal for compliance locks
 
-    # Initialize progress indicator (always show unless explicitly disabled)
+    # Initialize progress indicator
     progress = ProgressIndicator(
         estimated_total_objects=object_count,
         batch_size=1000,
-        show_progress=True  # Always show progress updates
+        show_progress=True
     )
 
     # Set up interrupt handler
     with InterruptHandler() as interrupt_handler:
-        for batch in cleanup_manager.stream_object_versions_in_batches(bucket_name, prefix, batch_size=1000):
-            # Check for interrupt before processing next batch
-            if interrupt_handler.check():
-                interrupted = True
-                logger.warning(f"⚠ Interrupt received after processing {batch_num} batches")
-                progress.finish(success=False, interrupted=True)
-                break
+        if workers == 1:
+            # Sequential processing (original behavior)
+            for batch in cleanup_manager.stream_object_versions_in_batches(bucket_name, prefix, batch_size=1000):
+                if interrupt_handler.check():
+                    interrupted = True
+                    logger.warning(f"⚠ Interrupt received after processing {batch_num} batches")
+                    progress.finish(success=False, interrupted=True)
+                    break
 
-            batch_num += 1
-            batch_size = sum(len(versions) for versions in batch.values())
-            total_versions_processed += batch_size
+                batch_num += 1
+                batch_size = sum(len(versions) for versions in batch.values())
+                total_versions_processed[0] += batch_size
 
-            if debug:
-                print(f"DEBUG: Processing batch {batch_num} ({batch_size} versions)...", flush=True)
-            logger.info(f"Processing batch {batch_num} ({batch_size} versions, cumulative: {total_versions_processed})...")
+                if debug:
+                    print(f"DEBUG: Processing batch {batch_num} ({batch_size} versions)...", flush=True)
+                logger.info(f"Processing batch {batch_num} ({batch_size} versions, cumulative: {total_versions_processed[0]})...")
 
-            # Check compliance locks for this batch
-            can_proceed = cleanup_manager.check_batch_compliance_locks(bucket_name, batch, object_lock_config)
+                can_proceed = cleanup_manager.check_batch_compliance_locks(bucket_name, batch, object_lock_config)
 
-            if not can_proceed:
-                logger.error(f"✗ ABORTING at batch {batch_num}: Found objects with active compliance locks that prevent deletion")
-                all_deleted = False
-                progress.finish(success=False, interrupted=False)
-                break
+                if not can_proceed:
+                    logger.error(f"✗ ABORTING at batch {batch_num}: Found objects with active compliance locks that prevent deletion")
+                    all_deleted = False
+                    progress.finish(success=False, interrupted=False)
+                    break
 
-            # Delete this batch
-            batch_deleted = cleanup_manager.cleanup_object_versions(bucket_name, batch)
-            if not batch_deleted:
-                all_deleted = False
-                logger.warning(f"⚠ Batch {batch_num} had deletion failures")
+                batch_deleted = cleanup_manager.cleanup_object_versions(bucket_name, batch)
+                if not batch_deleted:
+                    all_deleted = False
+                    logger.warning(f"⚠ Batch {batch_num} had deletion failures")
 
-            # Update progress indicator
-            progress.update(
-                batch_num=batch_num,
-                batch_size=batch_size,
-                total_versions=total_versions_processed,
-                total_objects=len(cleanup_manager.deletion_status)
-            )
+                progress.update(
+                    batch_num=batch_num,
+                    batch_size=batch_size,
+                    total_versions=total_versions_processed[0],
+                    total_objects=len(cleanup_manager.deletion_status)
+                )
+        else:
+            # Parallel processing with ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = []
+                batch_metadata = []  # Track (batch_num, batch_size) for each future
+
+                for batch in cleanup_manager.stream_object_versions_in_batches(bucket_name, prefix, batch_size=1000):
+                    if interrupt_handler.check() or abort_event.is_set():
+                        interrupted = True
+                        logger.warning(f"⚠ Interrupt/abort received after submitting {batch_num} batches")
+                        break
+
+                    batch_num += 1
+                    batch_size_val = sum(len(versions) for versions in batch.values())
+
+                    future = executor.submit(
+                        cleanup_manager._process_batch_worker,
+                        bucket_name, batch, batch_num, object_lock_config, abort_event
+                    )
+                    futures.append(future)
+                    batch_metadata.append((batch_num, batch_size_val))
+
+                # Wait for all submitted batches to complete and update progress
+                for idx, future in enumerate(futures):
+                    if interrupt_handler.check():
+                        interrupted = True
+                        break
+                    try:
+                        success, batch_size_result = future.result()
+                        batch_num_val, _ = batch_metadata[idx]
+
+                        if not success:
+                            all_deleted = False
+
+                        # Update progress (thread-safe)
+                        with cleanup_manager._lock:
+                            total_versions_processed[0] += batch_size_result
+                            progress.update(
+                                batch_num=batch_num_val,
+                                batch_size=batch_size_result,
+                                total_versions=total_versions_processed[0],
+                                total_objects=len(cleanup_manager.deletion_status)
+                            )
+                    except Exception as e:
+                        logger.error(f"Worker exception: {e}")
+                        all_deleted = False
+
+                if interrupted:
+                    progress.finish(success=False, interrupted=True)
+                elif abort_event.is_set():
+                    progress.finish(success=False, interrupted=False)
 
     # Finish progress display
     if not interrupted and all_deleted:
@@ -1288,22 +1398,22 @@ def main(bucket_name, endpoint_url, profile_name=None, access_key=None, secret_k
         progress.finish(success=False, interrupted=False)
 
     # Update final stats
-    cleanup_manager.stats['total_versions'] = total_versions_processed
+    cleanup_manager.stats['total_versions'] = total_versions_processed[0]
     cleanup_manager.stats['total_objects'] = len(cleanup_manager.deletion_status)
 
     if interrupted:
-        logger.warning(f"⚠ INTERRUPTED: Processed {batch_num} batches ({total_versions_processed} versions) before interrupt")
+        logger.warning(f"⚠ INTERRUPTED: Processed {batch_num} batches ({total_versions_processed[0]} versions) before interrupt")
         print(f"\n{'='*80}", flush=True)
         print(f"⚠ PARTIAL COMPLETION - Interrupted by user", flush=True)
         print(f"{'='*80}", flush=True)
         print(f"Batches processed: {batch_num}", flush=True)
-        print(f"Versions processed: {total_versions_processed}", flush=True)
+        print(f"Versions processed: {total_versions_processed[0]}", flush=True)
         print(f"Objects processed: {len(cleanup_manager.deletion_status)}", flush=True)
         print(f"{'='*80}\n", flush=True)
     elif all_deleted:
-        logger.info(f"✓ Successfully processed {batch_num} batches ({total_versions_processed} total versions)")
+        logger.info(f"✓ Successfully processed {batch_num} batches ({total_versions_processed[0]} total versions)")
     else:
-        logger.warning(f"⚠ Processed {batch_num} batches with some failures ({total_versions_processed} total versions)")
+        logger.warning(f"⚠ Processed {batch_num} batches with some failures ({total_versions_processed[0]} total versions)")
 
     # Step 6: Delete bucket if all objects were successfully removed
     if not interrupted and all_deleted and not dry_run and delete_bucket:
@@ -1383,17 +1493,23 @@ if __name__ == "__main__":
                       help="Bypass Governance mode retention locks. Compliance mode locks still block deletion.")
     parser.add_option("-x", "--prefix", dest="prefix", action="store", default="",
                       help="Only process objects under this key prefix (e.g. 'backups/node1/')")
+    parser.add_option("-w", "--workers", dest="workers", type="int", default=3,
+                      help="Number of parallel workers for batch processing (1-10, default: 3)")
 
     (options, args) = parser.parse_args()
-    
+
     if not options.bucket:
         parser.error("Bucket name is required. Use -b or --bucket option.")
-    
+
     # Validate credential options
     if options.access_key and not options.secret_key:
         parser.error("Both --access-key and --secret-key must be provided together.")
     if options.secret_key and not options.access_key:
         parser.error("Both --access-key and --secret-key must be provided together.")
+
+    # Validate workers option
+    if options.workers < 1 or options.workers > 10:
+        parser.error("Workers must be between 1 and 10.")
     
     logger.info(" -------------------------  SCRIPT START -------------------------")
     logger.info(f"Target bucket: {options.bucket}")
@@ -1405,7 +1521,8 @@ if __name__ == "__main__":
     logger.info(f"Delete bucket after cleanup: {options.delete_bucket}")
     logger.info(f"Force governance bypass: {options.force}")
     logger.info(f"Prefix filter: {options.prefix or '(entire bucket)'}")
-    
+    logger.info(f"Parallel workers: {options.workers}")
+
     try:
         success = main(
             options.bucket,
@@ -1417,7 +1534,8 @@ if __name__ == "__main__":
             options.dryrun,
             options.delete_bucket,
             options.force,
-            options.prefix
+            options.prefix,
+            options.workers
         )
         exit_code = 0 if success else 1
     except KeyboardInterrupt:
